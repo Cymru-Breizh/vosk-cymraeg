@@ -16,3 +16,8 @@ models
 results
 *.tar.gz
 !openfst-1.8.3.tar.gz
+.venv-container
+
+# Working directories of out-of-container runs (recipe state, job logs)
+work/
+logs/

@@ -10,11 +10,28 @@ uv run fetch
 ```
 Note that you need to have the enviroment variable HF_TOKEN set in order to read from HuggingFace. This can be set using a .env file in the root directory of the project.
 
+## Publishing a trained model
+
+`publish.sh` uploads the bundled model (`models/model.tar.gz`, as written by the
+recipe's `copy_final_result.sh`) to a HuggingFace model repo, reading `HF_TOKEN`
+from `.env`:
+
+```sh
+./publish.sh <user>/<repo> models/model.tar.gz
+```
+
 ## Running the training environment
 This repository supports both [Dev Containers](https://containers.dev/) and [Docker compose](https://docs.docker.com/compose/) and both use the same Dockerfile.
 
-To use Docker compose run and attach to the training environment run the following command:
-`docker compose run --rm training_env`. The current Docker compose file is set up with a default user, UID, and GID. You should change these to the same as the host machine to ensure that files made within the environment has the correct permissions and owners. You can find the current users UID and GID by using the `id` command on Linux.
+The Makefile is the front door:
+
+```sh
+make setup   # one-off: writes .env with your HF_TOKEN (prompts if unset)
+make build   # build the training image
+make run     # start and attach to the training environment
+```
+
+Your UID/GID are detected and passed in automatically by the `make` targets, so files created inside the environment have the correct host ownership — no manual configuration needed. GPU selection and other variables live in `.env` (see [howto.md](howto.md) for the full table).
 
 ## Datasets Used
 

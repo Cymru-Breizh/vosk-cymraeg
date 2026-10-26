@@ -11,13 +11,27 @@ echo "running cmd.sh"
 
 nj=4       # number of parallel jobs - 1 is perfect for such a small dataset (Was 3 before)
 lm_order=3 # language model order (n-gram quantity) - 1 is enough for digits grammar
-stage=$1
+pocolm_max_memory=4G # memory ceiling passed to pocolm; raise for a larger corpus
+
+# The positional argument is an *upper* bound on the stage -- the opposite of
+# the usual Kaldi --stage convention (see howto.md). --start-stage adds the
+# missing lower bound, so a range can be run rather than always starting from
+# the beginning. That is what lets the CPU stages and the GPU chain stage run
+# as two separate jobs (on a cluster, say) against one working directory; left
+# at its default the script behaves exactly as before.
+start_stage=-1
+
+# Passed through to the chain script, which uses the normal Kaldi convention
+# where --stage IS a starting point. Splitting the chain script's own CPU
+# stages (0-13, ivector + egs) from its GPU stage (14) would use this.
+chain_stage=0
 
 # Safety mechanism (possible running this script with modified arguments)
 . utils/parse_options.sh || exit 1
 
 
 [[ $# -eq 0 ]] && { echo "Wrong arguments!"; exit 1; }
+stage=$1
 
 if [ $stage -eq -1 ]; then
     echo
@@ -43,12 +57,14 @@ if [ $stage -eq -1 ]; then
     # and copy the generated metadata in the recipe `data` folder
 fi
 
-if [ $stage -ge 0 ]; then
+if [ $stage -ge 0 ] && [ $start_stage -le 0 ]; then
     echo
     echo "===== VALIDATING DATA ====="
     echo
     
     for split in train dev test; do
+        # Data prepared without a test split (final evaluation outside the recipe)
+        [ -d data/$split ] || { echo "Skipping $split (no data/$split directory)"; continue; }
         # Making spk2utt files
         utils/utt2spk_to_spk2utt.pl data/$split/utt2spk > data/$split/spk2utt
         echo
@@ -62,13 +78,14 @@ if [ $stage -ge 0 ]; then
     echo "done"
 fi
 
-if [ $stage -ge 1 ]; then
+if [ $stage -ge 1 ] && [ $start_stage -le 1 ]; then
     echo
     echo "===== FEATURES EXTRACTION ====="
     echo
     mfccdir=mfcc
     
     for split in train dev test; do
+        [ -d data/$split ] || { echo "Skipping $split (no data/$split directory)"; continue; }
         # Making feats.scp files
         steps/make_mfcc.sh --nj $nj --cmd "$train_cmd" data/$split exp/make_mfcc/$split $mfccdir || exit 1;
         # Making cmvn.scp files
@@ -77,39 +94,68 @@ if [ $stage -ge 1 ]; then
 fi
 
 
-if [ $stage -ge 2 ]; then
+if [ $stage -ge 2 ] && [ $start_stage -le 2 ]; then
     echo
     echo "===== LANGUAGE MODEL CREATION ====="
-    echo "==== MAKING lm.arpa ===="
+    echo "==== MAKING lm.arpa (pocolm) ===="
     echo
-    loc=`which ngram-count`;
-    if [ -z $loc ]; then
-            if uname -a | grep 64 >/dev/null; then
-                sdir=$KALDI_ROOT/tools/srilm/bin/i686-m64
-            else
-                sdir=$KALDI_ROOT/tools/srilm/bin/i686
-            fi
-            if [ -f $sdir/ngram-count ]; then
-                echo "Using SRILM language modelling tool from $sdir"
-                export PATH=$PATH:$sdir
-            else
-                echo "SRILM toolkit is probably not installed.
-                      Instructions: tools/install_srilm.sh"
-                exit 1
-            fi
+    if ! command -v train_lm.py >/dev/null; then
+        echo "pocolm not found on PATH."
+        echo "Expected at \$KALDI_ROOT/tools/pocolm, added to PATH by path.sh."
+        echo "Rebuild the training image if it is missing."
+        exit 1
     fi
+
     local=data/local
-    mkdir $local/tmp
-    ngram-count -order $lm_order -write-vocab $local/tmp/vocab-full.txt -wbdiscount -text $local/corpus.txt -lm $local/tmp/lm.arpa
-    
-    mkdir $local/lm
-    gzip -c $local/tmp/lm.arpa > data/local/lm/lm_tglarge.arpa.gz
-    
+    mkdir -p $local/tmp $local/lm
+
+    # pocolm consumes a directory of text files: one per data source, plus a
+    # held-out dev.txt it uses to tune the discounting constants and -- once
+    # there is more than one source -- the interpolation weights. Extra corpora
+    # (the techiaith text datasets behind export's --additional_text, or OSCAR)
+    # drop in here as additional .txt files, and pocolm learns what each is
+    # worth instead of letting raw sentence count decide.
+    pocolm_dir=$local/pocolm
+    rm -rf $pocolm_dir
+    mkdir -p $pocolm_dir/text
+
+    grep -v '^[[:space:]]*$' $local/corpus.txt > $pocolm_dir/text/transcripts.txt
+
+    # dev.txt is the Kaldi dev transcripts with the utterance id stripped. The
+    # LM text is built from the train split only (export_kaldi.py), so this is
+    # genuinely held out -- measured overlap is ~2%, almost all of it very short
+    # filler utterances that recur naturally across splits.
+    if [ ! -f data/dev/text ]; then
+        echo "data/dev/text is missing -- pocolm needs held-out text to tune on."
+        exit 1
+    fi
+    cut -d' ' -f2- data/dev/text | grep -v '^[[:space:]]*$' > $pocolm_dir/text/dev.txt
+
+    # --num-words=0 leaves the vocabulary unlimited, matching what ngram-count
+    # did here, so this swap changes the estimator and nothing else. (pocolm can
+    # instead take --wordlist to pin the LM vocab to the lexicon; that moves a
+    # second variable, so it belongs in its own experiment.)
+    train_lm.py --num-words=0 \
+                --num-splits=5 \
+                --warm-start-ratio=10 \
+                --max-memory=$pocolm_max_memory \
+                --keep-int-data=true \
+                $pocolm_dir/text $lm_order $pocolm_dir/work $pocolm_dir/lm || exit 1
+
+    format_arpa_lm.py --max-memory=$pocolm_max_memory $pocolm_dir/lm > $local/tmp/lm.arpa || exit 1
+
+    gzip -c $local/tmp/lm.arpa > $local/lm/lm_tglarge.arpa.gz
+
+    # Dev perplexity, so pocolm-vs-SRILM can be compared without a full decode.
+    get_data_prob.py --max-memory=$pocolm_max_memory \
+                     $pocolm_dir/text/dev.txt $pocolm_dir/lm \
+        2>&1 | tee $pocolm_dir/dev_perplexity.log
+
     echo "done"
 fi
 
 
-if [ $stage -ge 3 ]; then
+if [ $stage -ge 3 ] && [ $start_stage -le 3 ]; then
     echo
     echo "==== MAKING G.fst ===="
     echo
@@ -126,7 +172,7 @@ if [ $stage -ge 3 ]; then
                                  $lang data/lang_nosp_test_tglarge
 fi
 
-if [ $stage -ge 4 ]; then
+if [ $stage -ge 4 ] && [ $start_stage -le 4 ]; then
     echo
     echo "===== MONO TRAINING ====="
     echo
@@ -145,7 +191,7 @@ if [ $stage -ge 4 ]; then
     steps/align_si.sh --boost-silence 1.25 --nj $nj --cmd "$train_cmd" data/train data/lang_nosp exp/mono exp/mono_ali_train || exit 1
 fi
 
-if [ $stage -ge 5 ]; then
+if [ $stage -ge 5 ] && [ $start_stage -le 5 ]; then
     echo
     echo "===== TRI1 (first triphone pass) TRAINING ====="
     echo
@@ -164,7 +210,7 @@ if [ $stage -ge 5 ]; then
     steps/align_si.sh --nj $nj --cmd "$train_cmd" data/train data/lang_nosp exp/tri1 exp/tri1_ali_train
 fi
 
-if [ $stage -ge 6 ]; then
+if [ $stage -ge 6 ] && [ $start_stage -le 6 ]; then
     echo
     echo "===== train an LDA+MLLT system ====="
     echo
@@ -175,7 +221,7 @@ if [ $stage -ge 6 ]; then
     steps/align_si.sh --nj $nj --cmd "$train_cmd" --use-graphs true data/train data/lang_nosp exp/tri2b exp/tri2b_ali_train
 fi
 
-if [ $stage -ge 7 ]; then
+if [ $stage -ge 7 ] && [ $start_stage -le 7 ]; then
     echo
     echo "===== Train tri3b, which is LDA+MLLT+SAT ====="
     echo
@@ -184,7 +230,7 @@ fi
 
 # Now we compute the pronunciation and silence probabilities from training data,
 # and re-create the lang directory.
-if [ $stage -ge 8 ]; then
+if [ $stage -ge 8 ] && [ $start_stage -le 8 ]; then
     echo
     echo "===== compute the pronunciation and silence probabilities ====="
     echo
@@ -224,7 +270,7 @@ if [ $stage -ge 8 ]; then
 fi
 
 
-if [ $stage -ge 9 ]; then
+if [ $stage -ge 9 ] && [ $start_stage -le 9 ]; then
     echo
     echo "===== STAGE 9 ====="
     echo "==== Test the tri3b system with the silprobs and pron-probs ===="
@@ -255,7 +301,7 @@ elapsed_time=$((elapsed_time / 60))
 echo "@@@ Elapsed time: $elapsed_time minutes" 
 
 
-if [ $stage -ge 10 ]; then
+if [ $stage -ge 10 ] && [ $start_stage -le 10 ]; then
     echo
     echo "===== STAGE 10 ====="
     echo "==== Train a chain model ===="
@@ -263,7 +309,7 @@ if [ $stage -ge 10 ]; then
     
     # Uncomment the desired recipe for training
     #local/chain/run_tdnn_1j_lay12.sh
-    local/chain/run_tdnn_260412.sh
+    local/chain/run_tdnn_260412.sh --stage $chain_stage || { echo "ERROR: chain training (stage 10) failed — model NOT built"; exit 1; }
 fi
 
 echo

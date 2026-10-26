@@ -111,19 +111,26 @@ def main() -> None:
     # Build files specific to train/dev/test datasets
     build_dataset("train", train_dataset, output_folder)
 
-    if args.dev:
+    # dev/test are optional: data prepared without a test split (when the
+    # final evaluation runs outside the recipe) skips quietly when the CSV
+    # doesn't exist.
+    if args.dev and args.dev.exists():
         build_dataset(
             "dev",
             load_dataset(args.dev, args.lang),
             output_folder,
         )
+    elif args.dev:
+        _logger.warning(f"Dev dataset {args.dev} not found — skipping")
 
-    if args.test:
+    if args.test and args.test.exists():
         build_dataset(
             "test",
             load_dataset(args.test, args.lang),
             output_folder,
         )
+    elif args.test:
+        _logger.warning(f"Test dataset {args.test} not found — skipping")
 
 
 def filter_sentence(sentence: str) -> bool:

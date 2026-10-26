@@ -70,6 +70,14 @@ echo "$0 $@"  # Print the command line for logging
 . ./path.sh
 . ./utils/parse_options.sh
 
+# Data prepared without a test split (when the final evaluation runs outside
+# the recipe): fall back to the dev split for an in-recipe sanity decode, and
+# skip decoding (stages 16/17) entirely if neither split is present. Stage 17
+# still builds the _online model that copy_final_result.sh bundles.
+if [ ! -d data/test ]; then
+  if [ -d data/dev ]; then test_sets="dev"; else test_sets=""; fi
+fi
+
 if ! cuda-compiled; then
   cat <<EOF && exit 1
 This script is intended to be used with GPUs but you have not compiled Kaldi with CUDA
@@ -270,6 +278,8 @@ if [ $stage -le 16 ]; then
   for data in $test_sets; do
     (
       nspk=$(wc -l <data/${data}_hires/spk2utt)
+      # cap parallel decode jobs: a CV-derived dev split can have many speakers
+      [ "$nspk" -le "$decode_nj" ] || nspk=$decode_nj
       steps/nnet3/decode.sh \
           --acwt 1.0 --post-decode-acwt 10.0 \
           --frames-per-chunk $frames_per_chunk \
@@ -303,6 +313,8 @@ if $test_online_decoding && [ $stage -le 17 ]; then
   for data in $test_sets; do
     (
       nspk=$(wc -l <data/${data}_hires/spk2utt)
+      # cap parallel decode jobs: a CV-derived dev split can have many speakers
+      [ "$nspk" -le "$decode_nj" ] || nspk=$decode_nj
       # note: we just give it "data/${data}" as it only uses the wav.scp, the
       # feature type does not matter.
       steps/online/nnet3/decode.sh \

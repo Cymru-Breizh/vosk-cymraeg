@@ -72,10 +72,32 @@ RUN locale-gen en_US.UTF-8
 # Force python to refer to python2
 RUN ln -s python2.7 /usr/bin/python
 
-# SRILM (official site broken, using GitHub mirror)
+# pocolm (Apache-2.0) for language modelling, replacing SRILM.
+#
+# SRILM's Research Community License limits use to non-commercial research, which
+# is why published Kaldi/Vosk models carried CC-BY-NC. It was also being fetched
+# from an unauthorised third-party mirror rather than SRI's download form, so the
+# licence was never accepted. pocolm is permissive, so models built with it can
+# ship under Apache-2.0/CC-BY; it also tunes discounting constants (and, once
+# there is more than one text source, interpolation weights) on held-out dev data
+# rather than using the fixed Witten-Bell discounting we had before.
+#
+# numpy is a genuine runtime dependency (scripts/optimize_metaparameters.py and
+# scripts/internal/bfgs.py). We build `src` directly rather than running the
+# top-level `make`, because pocolm's check_dependencies.sh fails the build unless
+# subversion is installed -- a vestigial check inherited from Kaldi; pocolm never
+# uses svn.
+#
+# pocolm's scripts invoke each other by bare name, relying on their python3
+# shebangs plus scripts/ being on PATH -- recipes/cy/path.sh adds it. Note the
+# python -> python2.7 symlink above does not affect them.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3-numpy && \
+    rm -rf /var/lib/apt/lists/*
+
 WORKDIR /opt/kaldi/tools
-RUN wget -O srilm.tar.gz "https://github.com/weimeng23/SRILM/raw/master/srilm-1.7.3.tar.gz" && \
-    bash extras/install_srilm.sh
+RUN git clone --depth 1 https://github.com/danpovey/pocolm.git pocolm && \
+    make -C pocolm/src -j $(nproc)
 
 # Setup the user profile (automatically uses host user if built with docker compose)
 ARG USERNAME

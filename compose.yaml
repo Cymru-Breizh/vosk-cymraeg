@@ -1,3 +1,11 @@
+# Variables are interpolated from a `.env` file in this directory (native
+# Docker Compose behaviour; `make setup` writes HF_TOKEN and HF_USERNAME, and
+# the make targets pass UID/GID in from the shell).
+# Recognised variables:
+#   HF_TOKEN      HuggingFace token (private datasets/models)
+#   HF_USERNAME   HuggingFace username (optional)
+#   DEVICE        GPU id to expose (default "2"); single id only
+#   UID / GID     host user/group ids for in-container file ownership
 services:
   training_env:
     image: kaldi-training-env
@@ -6,7 +14,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["0"]  # Use GPU 1 only (use ["0", "1"] for both)
+              device_ids: ["${DEVICE:-2}"]
               capabilities: [gpu]
     build:
       context: .
@@ -17,8 +25,22 @@ services:
         USER_GID: ${GID:-1000}
     volumes:
       - .:/workspaces/vosk
+      # Host HF + uv caches, so dataset downloads and python envs persist
+      # across container runs and are shared with host-side runs. (The uv
+      # mount also keeps ~/.cache writable: Docker creates bind-target parent
+      # dirs as root, so without a user-owned mount at .cache/uv, uv cannot
+      # create its cache.)
+      - ${HOME}/.cache/huggingface:/home/${USER}/.cache/huggingface
+      - ${HOME}/.cache/uv:/home/${USER}/.cache/uv
     environment:
-      - HF_TOKEN=${HF_TOKEN}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HF_USERNAME=${HF_USERNAME:-}
+      # Keep the container's venv separate from the host's (.venv) — they
+      # target different interpreters, and sharing one path makes uv rebuild
+      # it on every host<->container switch.
+      - UV_PROJECT_ENVIRONMENT=/workspaces/vosk/.venv-container
+      # Hardlinks fail across the bind-mounted uv cache; copy quietly.
+      - UV_LINK_MODE=copy
     stdin_open: true
     tty: true
 volumes:

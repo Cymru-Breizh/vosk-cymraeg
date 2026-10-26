@@ -21,6 +21,13 @@ nnet3_affix=
 . ./path.sh
 . utils/parse_options.sh
 
+# Data prepared without a test split (when the final evaluation runs outside
+# the recipe): fall back to the dev split so dev_hires + dev iVectors get
+# built for an in-recipe sanity decode; skip if neither split is present.
+if [ ! -d data/test ]; then
+  if [ -d data/dev ]; then test_sets="dev"; else test_sets=""; fi
+fi
+
 gmm_dir=exp/${gmm}
 ali_dir=exp/${gmm}_ali_${train_set}_sp
 
